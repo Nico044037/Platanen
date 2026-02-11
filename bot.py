@@ -1,37 +1,71 @@
 import discord
 from discord.ext import commands
 import os
+import json
+from datetime import datetime
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-intents.messages = True
 
 bot = commands.Bot(command_prefix="$", intents=intents)
 
-calendar_message_id = None
+DATA_FILE = "calendar_data.json"
 
 
-@bot.event
-async def on_ready():
-    print(f"Eingeloggt als {bot.user}")
+# -------------------------
+# JSON Speicher
+# -------------------------
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {}
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
 
 
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+
+# -------------------------
+# Embed erstellen
+# -------------------------
+def create_calendar_embed(guild_id):
+    data = load_data()
+    events = data.get(str(guild_id), [])
+
+    embed = discord.Embed(
+        title="📅 Server Kalender",
+        description="Geplante Termine:",
+        color=discord.Color.blue()
+    )
+
+    if not events:
+        embed.add_field(name="Keine Termine", value="Noch nichts geplant.", inline=False)
+    else:
+        for event in events:
+            embed.add_field(
+                name=f"🗓 {event['date']} | ⏰ {event['time']}",
+                value=f"{event['title']}",
+                inline=False
+            )
+
+    embed.set_footer(text="Nur editaccess Rolle kann bearbeiten")
+    return embed
+
+
+# -------------------------
+# Setup Command
+# -------------------------
 @bot.command()
 async def setup(ctx):
-
     guild = ctx.guild
 
-    # Rolle erstellen
     role = discord.utils.get(guild.roles, name="editaccess")
     if not role:
-        role = await guild.create_role(
-            name="editaccess",
-            colour=discord.Colour.blue(),
-            reason="Kalender Bearbeitungsrolle"
-        )
+        role = await guild.create_role(name="editaccess")
 
-    # Kanal erstellen
     channel = discord.utils.get(guild.channels, name="kalender")
 
     if not channel:
@@ -40,59 +74,106 @@ async def setup(ctx):
             guild.me: discord.PermissionOverwrite(send_messages=True)
         }
 
-        channel = await guild.create_text_channel(
-            "kalender",
-            overwrites=overwrites
-        )
+        channel = await guild.create_text_channel("kalender", overwrites=overwrites)
 
-    # Button erstellen
-    class EditButton(discord.ui.View):
-        def __init__(self):
-            super().__init__(timeout=None)
+    view = CalendarView()
+    embed = create_calendar_embed(guild.id)
+    await channel.send(embed=embed, view=view)
 
-        @discord.ui.button(label="Bearbeiten", style=discord.ButtonStyle.primary, custom_id="edit_calendar")
-        async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-            if role not in interaction.user.roles:
-                await interaction.response.send_message(
-                    "❌ Du hast keine Berechtigung!",
-                    ephemeral=True
-                )
-                return
-
-            class EditModal(discord.ui.Modal, title="Kalender bearbeiten"):
-                kalender_input = discord.ui.TextInput(
-                    label="Neuer Kalender Inhalt",
-                    style=discord.TextStyle.paragraph,
-                    required=True
-                )
-
-                async def on_submit(self, interaction: discord.Interaction):
-
-                    messages = [msg async for msg in channel.history(limit=10)]
-                    bot_message = next((m for m in messages if m.author == bot.user), None)
-
-                    if bot_message:
-                        await bot_message.edit(
-                            content=f"📅 **Server Kalender**\n\n{self.kalender_input.value}",
-                            view=EditButton()
-                        )
-
-                    await interaction.response.send_message(
-                        "✅ Kalender aktualisiert!",
-                        ephemeral=True
-                    )
-
-            await interaction.response.send_modal(EditModal())
-
-    # Kalender Nachricht senden
-    msg = await channel.send(
-        "📅 **Server Kalender**\n\nNoch keine Termine eingetragen.",
-        view=EditButton()
-    )
-
-    await ctx.reply("✅ Kalender wurde eingerichtet!")
+    await ctx.reply("✅ Kalender eingerichtet!")
 
 
-# Token aus Environment Variable (für Railway!)
+# -------------------------
+# Buttons
+# -------------------------
+class CalendarView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="➕ Termin hinzufügen", style=discord.ButtonStyle.green)
+    async def add_event(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+        role = discord.utils.get(interaction.guild.roles, name="editaccess")
+        if role not in interaction.user.roles:
+            await interaction.response.send_message("❌ Keine Berechtigung!", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(AddEventModal())
+
+
+    @discord.ui.button(label="🗑 Termin löschen", style=discord.ButtonStyle.red)
+    async def remove_event(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+        role = discord.utils.get(interaction.guild.roles, name="editaccess")
+        if role not in interaction.user.roles:
+            await interaction.response.send_message("❌ Keine Berechtigung!", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(RemoveEventModal())
+
+
+# -------------------------
+# Modal – Termin hinzufügen
+# -------------------------
+class AddEventModal(discord.ui.Modal, title="Neuen Termin hinzufügen"):
+
+    title_input = discord.ui.TextInput(label="Titel")
+    date_input = discord.ui.TextInput(label="Datum (TT.MM.JJJJ)")
+    time_input = discord.ui.TextInput(label="Uhrzeit (HH:MM)")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild_id = str(interaction.guild.id)
+        data = load_data()
+
+        if guild_id not in data:
+            data[guild_id] = []
+
+        data[guild_id].append({
+            "title": self.title_input.value,
+            "date": self.date_input.value,
+            "time": self.time_input.value
+        })
+
+        save_data(data)
+
+        await update_calendar_message(interaction)
+        await interaction.response.send_message("✅ Termin hinzugefügt!", ephemeral=True)
+
+
+# -------------------------
+# Modal – Termin löschen
+# -------------------------
+class RemoveEventModal(discord.ui.Modal, title="Termin löschen"):
+
+    title_input = discord.ui.TextInput(label="Titel des Termins")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild_id = str(interaction.guild.id)
+        data = load_data()
+
+        if guild_id in data:
+            data[guild_id] = [
+                event for event in data[guild_id]
+                if event["title"] != self.title_input.value
+            ]
+
+        save_data(data)
+
+        await update_calendar_message(interaction)
+        await interaction.response.send_message("🗑 Termin gelöscht!", ephemeral=True)
+
+
+# -------------------------
+# Kalender Nachricht updaten
+# -------------------------
+async def update_calendar_message(interaction):
+    channel = discord.utils.get(interaction.guild.channels, name="kalender")
+
+    async for message in channel.history(limit=20):
+        if message.author == bot.user:
+            await message.edit(embed=create_calendar_embed(interaction.guild.id), view=CalendarView())
+            break
+
+
+# -------------------------
 bot.run(os.getenv("TOKEN"))
