@@ -2,9 +2,16 @@ import discord
 from discord.ext import commands
 import os
 import asyncpg
+import asyncio
 
 TOKEN = os.getenv("TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not TOKEN:
+    raise Exception("TOKEN not found in environment variables!")
+
+if not DATABASE_URL:
+    raise Exception("DATABASE_URL not found in environment variables!")
 
 intents = discord.Intents.default()
 intents.members = True
@@ -16,14 +23,13 @@ pool = None
 
 
 # =========================
-# DATABASE SETUP
+# DATABASE
 # =========================
 async def setup_database():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with pool.acquire() as conn:
-        # Members table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS members (
                 user_id BIGINT,
@@ -34,7 +40,6 @@ async def setup_database():
             )
         """)
 
-        # Calendar table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS calendar_events (
                 id SERIAL PRIMARY KEY,
@@ -47,29 +52,24 @@ async def setup_database():
 
 
 # =========================
-# MEMBER SYNC
+# MEMBER LOGGING (SAFE)
 # =========================
-async def sync_guild_members(guild):
-    async with pool.acquire() as conn:
-        for member in guild.members:
-            await conn.execute("""
-                INSERT INTO members (user_id, username, display_name, guild_id)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (user_id, guild_id)
-                DO UPDATE SET
-                    username = EXCLUDED.username,
-                    display_name = EXCLUDED.display_name
-            """,
-            member.id,
-            member.name,
-            member.display_name,
-            guild.id
-            )
-
-
 @bot.event
 async def on_member_join(member):
-    await sync_guild_members(member.guild)
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO members (user_id, username, display_name, guild_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id, guild_id)
+            DO UPDATE SET
+                username = EXCLUDED.username,
+                display_name = EXCLUDED.display_name
+        """,
+        member.id,
+        member.name,
+        member.display_name,
+        member.guild.id
+        )
 
 
 @bot.event
@@ -87,7 +87,18 @@ async def on_member_remove(member):
 @bot.event
 async def on_member_update(before, after):
     if before.name != after.name or before.display_name != after.display_name:
-        await sync_guild_members(after.guild)
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE members
+                SET username = $1,
+                    display_name = $2
+                WHERE user_id = $3 AND guild_id = $4
+            """,
+            after.name,
+            after.display_name,
+            after.id,
+            after.guild.id
+            )
 
 
 # =========================
@@ -117,17 +128,16 @@ async def create_calendar_embed(guild_id):
                 inline=False
             )
 
-    embed.set_footer(text="Nur editaccess Rolle kann bearbeiten")
+    embed.set_footer(text="Nur editaccess Rolle darf bearbeiten")
     return embed
 
 
 async def update_calendar_message(guild):
     channel = discord.utils.get(guild.channels, name="kalender")
-
     if not channel:
         return
 
-    async for message in channel.history(limit=20):
+    async for message in channel.history(limit=10):
         if message.author == bot.user:
             embed = await create_calendar_embed(guild.id)
             await message.edit(embed=embed, view=CalendarView())
@@ -141,20 +151,20 @@ class CalendarView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def check_role(self, interaction):
+    async def has_permission(self, interaction):
         role = discord.utils.get(interaction.guild.roles, name="editaccess")
-        return role in interaction.user.roles
+        return role and role in interaction.user.roles
 
     @discord.ui.button(label="➕ Termin hinzufügen", style=discord.ButtonStyle.green)
     async def add_event(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.check_role(interaction):
+        if not await self.has_permission(interaction):
             await interaction.response.send_message("❌ Keine Berechtigung!", ephemeral=True)
             return
         await interaction.response.send_modal(AddEventModal())
 
     @discord.ui.button(label="🗑 Termin löschen", style=discord.ButtonStyle.red)
     async def remove_event(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.check_role(interaction):
+        if not await self.has_permission(interaction):
             await interaction.response.send_message("❌ Keine Berechtigung!", ephemeral=True)
             return
         await interaction.response.send_modal(RemoveEventModal())
@@ -163,7 +173,7 @@ class CalendarView(discord.ui.View):
 # =========================
 # MODALS
 # =========================
-class AddEventModal(discord.ui.Modal, title="Neuen Termin hinzufügen"):
+class AddEventModal(discord.ui.Modal, title="Termin hinzufügen"):
 
     title_input = discord.ui.TextInput(label="Titel")
     date_input = discord.ui.TextInput(label="Datum (TT.MM.JJJJ)")
@@ -187,7 +197,7 @@ class AddEventModal(discord.ui.Modal, title="Neuen Termin hinzufügen"):
 
 class RemoveEventModal(discord.ui.Modal, title="Termin löschen"):
 
-    event_id = discord.ui.TextInput(label="Event ID (steht im Kalender)")
+    event_id = discord.ui.TextInput(label="Event ID")
 
     async def on_submit(self, interaction: discord.Interaction):
         async with pool.acquire() as conn:
@@ -234,11 +244,14 @@ async def setup(ctx):
 @bot.event
 async def on_ready():
     await setup_database()
-
-    for guild in bot.guilds:
-        await sync_guild_members(guild)
-
     print(f"Bot online als {bot.user}")
 
 
-bot.run(TOKEN)
+# =========================
+# SAFE START
+# =========================
+async def main():
+    async with bot:
+        await bot.start(TOKEN)
+
+asyncio.run(main())
